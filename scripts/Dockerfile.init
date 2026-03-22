@@ -1,0 +1,4 @@
+FROM minio/mc:latest
+COPY init-bucket.sh /init-bucket.sh
+RUN chmod +x /init-bucket.sh
+ENTRYPOINT ["/init-bucket.sh"]
