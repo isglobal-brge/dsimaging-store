@@ -30,6 +30,7 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
       BUCKET_NAME: ${BUCKET_NAME:-imaging-data}
+      RECONCILE_INTERVAL_SECONDS: ${RECONCILE_INTERVAL_SECONDS:-10}
     depends_on:
       minio:
         condition: service_healthy
