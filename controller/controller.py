@@ -2,15 +2,17 @@
 """dsImagingStore controller.
 
 Receives MinIO bucket notifications and reconciles dataset artifacts:
-content_hash_index.parquet, sample_manifests.parquet, samples.parquet and
-manifest.yaml. Direct uploads to datasets/<id>/source/images/ therefore converge
-to the same layout produced by dsimaging-admin publish/rescan.
+content_hash_index.parquet, mask hash indexes, sample_manifests.parquet,
+samples.parquet and manifest.yaml. Direct uploads to
+datasets/<id>/source/images/ and datasets/<id>/source/masks/ therefore
+converge to the same layout produced by dsimaging-admin publish/rescan.
 """
 
 import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -52,10 +54,15 @@ def get_s3():
     )
 
 
-def extract_dataset_id_from_image_key(key):
-    """Extract dataset_id from datasets/<id>/source/images/... keys."""
+def extract_dataset_id_from_source_key(key):
+    """Extract dataset_id from datasets/<id>/source/{images,masks}/... keys."""
     parts = key.split("/")
-    if len(parts) >= 5 and parts[0] == "datasets" and parts[2:4] == ["source", "images"]:
+    if (
+        len(parts) >= 5
+        and parts[0] == "datasets"
+        and parts[2] == "source"
+        and parts[3] in {"images", "masks"}
+    ):
         return parts[1]
     return None
 
@@ -72,11 +79,12 @@ def pop_dirty_batch():
     return batch
 
 
-def record_success(dataset_id, n_samples):
+def record_success(dataset_id, n_samples, n_masks=0):
     with state_lock:
         last_reconcile[dataset_id] = {
             "at": utc_now(),
             "samples": n_samples,
+            "masks": n_masks,
         }
         last_errors.pop(dataset_id, None)
 
@@ -106,7 +114,7 @@ class Handler(BaseHTTPRequestHandler):
                 raw_key = record.get("s3", {}).get("object", {}).get("key", "")
                 key = unquote_plus(raw_key)
                 event_name = record.get("eventName", "")
-                dataset_id = extract_dataset_id_from_image_key(key)
+                dataset_id = extract_dataset_id_from_source_key(key)
                 if dataset_id:
                     log.info("Event: %s on %s (dataset: %s)", event_name, key, dataset_id)
                     mark_dirty(dataset_id)
@@ -188,9 +196,12 @@ def reconcile_loop():
         batch = pop_dirty_batch()
         for dataset_id in batch:
             try:
-                n_samples = reconcile_dataset(dataset_id)
-                record_success(dataset_id, n_samples)
-                log.info("Reconciled dataset %s (%s samples)", dataset_id, n_samples)
+                n_samples, n_masks = reconcile_dataset(dataset_id)
+                record_success(dataset_id, n_samples, n_masks)
+                log.info(
+                    "Reconciled dataset %s (%s samples, %s masks)",
+                    dataset_id, n_samples, n_masks,
+                )
             except Exception as e:
                 record_failure(dataset_id, e)
                 log.exception("Reconcile failed for dataset %s: %s", dataset_id, e)
@@ -201,13 +212,18 @@ def reconcile_dataset(dataset_id):
     s3 = get_s3()
     prefix = f"datasets/{dataset_id}"
     objects = list_objects(s3, f"{prefix}/source/images/")
+    mask_objects = list_objects(s3, f"{prefix}/source/masks/")
     samples = scan_s3_images(s3, prefix, objects)
+    masks = scan_s3_masks(
+        s3, prefix, mask_objects,
+        sample_ids=[sample["sample_id"] for sample in samples],
+    )
     if not samples:
         if dataset_artifacts_exist(s3, prefix):
-            write_dataset_artifacts(s3, prefix, dataset_id, samples)
-        return 0
-    write_dataset_artifacts(s3, prefix, dataset_id, samples)
-    return len(samples)
+            write_dataset_artifacts(s3, prefix, dataset_id, samples, masks)
+        return 0, len(masks)
+    write_dataset_artifacts(s3, prefix, dataset_id, samples, masks)
+    return len(samples), len(masks)
 
 
 def dataset_artifacts_exist(s3, prefix):
@@ -301,13 +317,43 @@ def scan_s3_images(s3, prefix, objects):
     return sorted(samples, key=lambda sample: sample["sample_id"])
 
 
-def write_dataset_artifacts(s3, prefix, dataset_id, samples):
+def scan_s3_masks(s3, prefix, objects, sample_ids=None):
+    root = f"{prefix.rstrip('/')}/source/masks/"
+    masks = []
+
+    for obj in objects:
+        key = obj["key"]
+        if not key.startswith(root):
+            continue
+        rel = key[len(root):]
+        if not rel or rel.endswith("/"):
+            continue
+        filename = rel.rsplit("/", 1)[-1]
+        if not is_image_file(filename):
+            continue
+        masks.append({
+            "sample_id": sample_id_from_mask_filename(filename, sample_ids),
+            "source_kind": "mask_file",
+            "primary_filename": filename,
+            "uri_path": rel,
+            "files": [{"path": rel, "role": "mask"}],
+            "content_hash": sha256_s3_object(s3, key),
+            "size": int(obj.get("size", 0)),
+            "last_modified": obj.get("last_modified"),
+            "etag": obj.get("etag"),
+        })
+
+    return sorted(masks, key=lambda sample: sample["sample_id"])
+
+
+def write_dataset_artifacts(s3, prefix, dataset_id, samples, masks=None):
     modality = existing_modality(s3, prefix, fallback="unknown")
+    masks = masks or []
     with tempfile.TemporaryDirectory() as tmpdir:
         uploads = [
             ("indexes/content_hash_index.parquet",
              write_parquet(tmpdir, "content_hash_index.parquet",
-                           build_hash_index(prefix, samples))),
+                           build_hash_index(prefix, samples, source_path="images"))),
             ("metadata/sample_manifests.parquet",
              write_parquet(tmpdir, "sample_manifests.parquet",
                            build_sample_manifests(samples))),
@@ -316,13 +362,20 @@ def write_dataset_artifacts(s3, prefix, dataset_id, samples):
                            build_samples_metadata(samples))),
             ("manifest.yaml",
              write_yaml(tmpdir, "manifest.yaml",
-                        generate_manifest(dataset_id, prefix, modality))),
+                        generate_manifest(dataset_id, prefix, modality,
+                                          has_masks=bool(masks)))),
         ]
+        if masks:
+            uploads.append(
+                ("indexes/masks_content_hash_index.parquet",
+                 write_parquet(tmpdir, "masks_content_hash_index.parquet",
+                               build_hash_index(prefix, masks, source_path="masks")))
+            )
         for rel_key, path in uploads:
             s3.upload_file(path, BUCKET, f"{prefix}/{rel_key}")
 
 
-def build_hash_index(prefix, samples):
+def build_hash_index(prefix, samples, source_path="images"):
     now = utc_now()
     if not samples:
         return pa.table({
@@ -337,7 +390,7 @@ def build_hash_index(prefix, samples):
         })
     return pa.table({
         "sample_id": [s["sample_id"] for s in samples],
-        "uri": [f"s3://{BUCKET}/{prefix}/source/images/{s['uri_path']}" for s in samples],
+        "uri": [f"s3://{BUCKET}/{prefix}/source/{source_path}/{s['uri_path']}" for s in samples],
         "content_hash": [s["content_hash"] for s in samples],
         "size": pa.array([s["size"] for s in samples], type=pa.int64()),
         "last_modified": [s.get("last_modified") or now for s in samples],
@@ -381,8 +434,8 @@ def build_samples_metadata(samples):
     })
 
 
-def generate_manifest(dataset_id, prefix, modality):
-    return {
+def generate_manifest(dataset_id, prefix, modality, has_masks=False):
+    manifest = {
         "schema_version": 1,
         "dataset_id": dataset_id,
         "modality": modality,
@@ -405,6 +458,16 @@ def generate_manifest(dataset_id, prefix, modality):
             "format": "parquet",
         },
     }
+    if has_masks:
+        manifest["assets"]["masks"] = {
+            "uri": f"s3://{BUCKET}/{prefix}/source/masks/",
+            "kind": "mask_root",
+            "content_hash_index": (
+                f"s3://{BUCKET}/{prefix}/indexes/"
+                "masks_content_hash_index.parquet"
+            ),
+        }
+    return manifest
 
 
 def existing_modality(s3, prefix, fallback):
@@ -457,6 +520,20 @@ def sample_id_from_filename(filename):
         if lower.endswith(ext):
             return filename[:-len(ext)]
     return os.path.splitext(filename)[0]
+
+
+def sample_id_from_mask_filename(filename, sample_ids=None):
+    stem = sample_id_from_filename(filename)
+    if sample_ids:
+        for sample_id in sorted(sample_ids, key=len, reverse=True):
+            if stem == sample_id or stem.startswith(f"{sample_id}_") or stem.startswith(f"{sample_id}-"):
+                return sample_id
+    suffix_pattern = (
+        r"(?i)(?:[_-](?:mask|seg|label|labels|roi|gtv[-_]?\d*|"
+        r"lesion[-_]?\d*|tumou?r[-_]?\d*))$"
+    )
+    stripped = re.sub(suffix_pattern, "", stem)
+    return stripped or stem
 
 
 def utc_now():

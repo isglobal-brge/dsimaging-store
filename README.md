@@ -42,7 +42,7 @@ DataSHIELD R session                 |
   |                                  |
   | imaging+dataset://lung_ct_v1     |
   |------------------------------>   |
-  | resolve -> manifest -> images    |
+  | resolve -> manifest -> images/masks |
 ```
 
 ## Configuration
@@ -61,10 +61,12 @@ Copy `.env.example` to `.env` and edit:
 ## Controller behaviour
 
 The controller listens for MinIO events under
-`datasets/<dataset_id>/source/images/`. When image objects are created or
-removed it rebuilds the dataset artifacts used by dsImaging:
+`datasets/<dataset_id>/source/images/` and
+`datasets/<dataset_id>/source/masks/`. When image or mask objects are created
+or removed it rebuilds the dataset artifacts used by dsImaging:
 
 - `indexes/content_hash_index.parquet`
+- `indexes/masks_content_hash_index.parquet` when masks exist
 - `metadata/sample_manifests.parquet`
 - `metadata/samples.parquet`
 - `manifest.yaml`
