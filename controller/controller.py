@@ -348,6 +348,7 @@ def scan_s3_masks(s3, prefix, objects, sample_ids=None):
 
 def write_dataset_artifacts(s3, prefix, dataset_id, samples, masks=None):
     modality = existing_modality(s3, prefix, fallback="unknown")
+    extra_metadata = read_existing_samples_metadata(s3, prefix)
     masks = masks or []
     with tempfile.TemporaryDirectory() as tmpdir:
         uploads = [
@@ -359,7 +360,7 @@ def write_dataset_artifacts(s3, prefix, dataset_id, samples, masks=None):
                            build_sample_manifests(samples))),
             ("metadata/samples.parquet",
              write_parquet(tmpdir, "samples.parquet",
-                           build_samples_metadata(samples))),
+                           build_samples_metadata(samples, extra_metadata))),
             ("manifest.yaml",
              write_yaml(tmpdir, "manifest.yaml",
                         generate_manifest(dataset_id, prefix, modality,
@@ -420,18 +421,74 @@ def build_sample_manifests(samples):
     })
 
 
-def build_samples_metadata(samples):
+def build_samples_metadata(samples, extra_metadata=None):
     if not samples:
-        return pa.table({
+        base = pa.table({
             "sample_id": pa.array([], type=pa.string()),
             "source_kind": pa.array([], type=pa.string()),
             "n_files": pa.array([], type=pa.int32()),
         })
-    return pa.table({
-        "sample_id": [s["sample_id"] for s in samples],
-        "source_kind": [s["source_kind"] for s in samples],
-        "n_files": pa.array([len(s["files"]) for s in samples], type=pa.int32()),
-    })
+    else:
+        base = pa.table({
+            "sample_id": [s["sample_id"] for s in samples],
+            "source_kind": [s["source_kind"] for s in samples],
+            "n_files": pa.array([len(s["files"]) for s in samples], type=pa.int32()),
+        })
+    if extra_metadata is None:
+        return base
+    return left_join_metadata(base, extra_metadata)
+
+
+def normalise_metadata_table(table):
+    if "sample_id" not in table.column_names:
+        return None
+    idx = table.column_names.index("sample_id")
+    return table.set_column(idx, "sample_id", table["sample_id"].cast(pa.string()))
+
+
+def left_join_metadata(base, extra_metadata):
+    extra_metadata = normalise_metadata_table(extra_metadata)
+    if extra_metadata is None:
+        return base
+
+    base_ids = base["sample_id"].to_pylist()
+    rows_by_id = {}
+    for row in extra_metadata.to_pylist():
+        sample_id = row.get("sample_id")
+        if sample_id in rows_by_id:
+            log.warning("Ignoring preserved metadata with duplicate sample_id: %s", sample_id)
+            return base
+        rows_by_id[sample_id] = row
+
+    extra_columns = [
+        name for name in extra_metadata.column_names
+        if name != "sample_id" and name not in base.column_names
+    ]
+    arrays = {name: base[name] for name in base.column_names}
+    schema = extra_metadata.schema
+    for name in extra_columns:
+        field = schema.field(name)
+        values = [
+            rows_by_id.get(sample_id, {}).get(name)
+            for sample_id in base_ids
+        ]
+        arrays[name] = pa.array(values, type=field.type)
+    return pa.table(arrays)
+
+
+def read_existing_samples_metadata(s3, prefix):
+    try:
+        response = s3.get_object(Bucket=BUCKET, Key=f"{prefix}/metadata/samples.parquet")
+        body = response["Body"]
+        try:
+            data = body.read()
+        finally:
+            body.close()
+        if not data:
+            return None
+        return pq.read_table(pa.BufferReader(data))
+    except Exception:
+        return None
 
 
 def generate_manifest(dataset_id, prefix, modality, has_masks=False):
