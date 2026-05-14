@@ -21,6 +21,7 @@ services:
     restart: unless-stopped
 
   controller:
+    image: ${DSIMAGING_STORE_CONTROLLER_IMAGE:-dsimaging-store-controller:local}
     build:
       context: ./controller
     ports:
@@ -46,6 +47,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
       BUCKET_NAME: ${BUCKET_NAME:-imaging-data}
+      WEBHOOK_RETRIES: ${WEBHOOK_RETRIES:-12}
+      WEBHOOK_RETRY_SECONDS: ${WEBHOOK_RETRY_SECONDS:-5}
     depends_on:
       minio:
         condition: service_healthy

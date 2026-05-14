@@ -8,7 +8,6 @@ datasets/<id>/source/images/ and datasets/<id>/source/masks/ therefore
 converge to the same layout produced by dsimaging-admin publish/rescan.
 """
 
-import hashlib
 import json
 import logging
 import os
@@ -23,6 +22,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 
+from dsimaging_admin.manifest import (
+    build_hash_index as core_build_hash_index,
+    build_sample_manifests as core_build_sample_manifests,
+    build_samples_metadata as core_build_samples_metadata,
+    generate_manifest as core_generate_manifest,
+    scan_s3_images as core_scan_s3_images,
+    scan_s3_masks as core_scan_s3_masks,
+)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("controller")
 
@@ -31,16 +39,29 @@ MINIO_ACCESS_KEY = os.environ.get("MINIO_ROOT_USER", "minioadmin")
 MINIO_SECRET_KEY = os.environ.get("MINIO_ROOT_PASSWORD", "minioadmin123")
 BUCKET = os.environ.get("BUCKET_NAME", "imaging-data")
 RECONCILE_INTERVAL_SECONDS = int(os.environ.get("RECONCILE_INTERVAL_SECONDS", "10"))
-
-IMAGE_EXTENSIONS = frozenset({
-    ".nii.gz", ".nii", ".nrrd", ".mha", ".mhd", ".dcm",
-    ".svs", ".tif", ".tiff", ".png", ".jpg",
-})
+PUBLISH_LOCK = ".publish-lock"
+WEBHOOK_PREFIX = "datasets/"
+SOURCE_PREFIXES = [
+    "datasets/<dataset_id>/source/images/",
+    "datasets/<dataset_id>/source/masks/",
+]
+MANAGED_ARTIFACTS = (
+    "manifest.yaml",
+    "indexes/content_hash_index.parquet",
+    "indexes/masks_content_hash_index.parquet",
+    "metadata/sample_manifests.parquet",
+    "metadata/samples.parquet",
+)
+DATASET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 
 state_lock = threading.Lock()
 dirty_datasets = set()
 last_reconcile = {}
 last_errors = {}
+
+
+class PublishInProgress(Exception):
+    """Raised when a dataset has an active publish lock."""
 
 
 def get_s3():
@@ -100,6 +121,41 @@ def record_failure(dataset_id, error):
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
+        if self.path.startswith("/reconcile/"):
+            dataset_id = self.path.split("/reconcile/", 1)[1]
+            if not DATASET_ID_RE.match(dataset_id or ""):
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "invalid dataset_id"}).encode())
+                return
+            try:
+                n_samples, n_masks = reconcile_dataset(dataset_id)
+                record_success(dataset_id, n_samples, n_masks)
+                self.write_json({
+                    "status": "ok",
+                    "dataset_id": dataset_id,
+                    "samples": n_samples,
+                    "masks": n_masks,
+                })
+            except PublishInProgress:
+                mark_dirty(dataset_id)
+                self.send_response(409)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "status": "locked",
+                    "dataset_id": dataset_id,
+                    "error": "publish in progress",
+                }).encode())
+            except Exception as e:
+                record_failure(dataset_id, e)
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
+
         if self.path != "/webhook/minio":
             self.send_response(404)
             self.end_headers()
@@ -131,6 +187,10 @@ class Handler(BaseHTTPRequestHandler):
             self.write_json({
                 "status": "ok",
                 "bucket": BUCKET,
+                "minio_endpoint": MINIO_ENDPOINT,
+                "webhook_prefix": WEBHOOK_PREFIX,
+                "source_prefixes": SOURCE_PREFIXES,
+                "reconcile_interval_seconds": RECONCILE_INTERVAL_SECONDS,
                 "dirty_datasets": sorted_snapshot(dirty_datasets),
                 "last_reconcile": snapshot(last_reconcile),
                 "last_errors": snapshot(last_errors),
@@ -172,6 +232,8 @@ def list_datasets():
     for page in paginator.paginate(Bucket=BUCKET, Prefix="datasets/", Delimiter="/"):
         for cp in page.get("CommonPrefixes", []):
             dataset_id = cp["Prefix"].strip("/").split("/")[-1]
+            if not prefix_has_current_objects(s3, f"datasets/{dataset_id}/"):
+                continue
             has_manifest = object_exists(s3, f"datasets/{dataset_id}/manifest.yaml")
             datasets.append({
                 "dataset_id": dataset_id,
@@ -191,6 +253,15 @@ def object_exists(s3, key):
         return False
 
 
+def prefix_has_current_objects(s3, prefix):
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if object_exists(s3, obj["Key"]):
+                return True
+    return False
+
+
 def reconcile_loop():
     while True:
         batch = pop_dirty_batch()
@@ -202,6 +273,9 @@ def reconcile_loop():
                     "Reconciled dataset %s (%s samples, %s masks)",
                     dataset_id, n_samples, n_masks,
                 )
+            except PublishInProgress:
+                mark_dirty(dataset_id)
+                log.info("Reconcile deferred for dataset %s: publish in progress", dataset_id)
             except Exception as e:
                 record_failure(dataset_id, e)
                 log.exception("Reconcile failed for dataset %s: %s", dataset_id, e)
@@ -211,6 +285,8 @@ def reconcile_loop():
 def reconcile_dataset(dataset_id):
     s3 = get_s3()
     prefix = f"datasets/{dataset_id}"
+    if object_exists(s3, f"{prefix}/{PUBLISH_LOCK}"):
+        raise PublishInProgress()
     objects = list_objects(s3, f"{prefix}/source/images/")
     mask_objects = list_objects(s3, f"{prefix}/source/masks/")
     samples = scan_s3_images(s3, prefix, objects)
@@ -219,23 +295,39 @@ def reconcile_dataset(dataset_id):
         sample_ids=[sample["sample_id"] for sample in samples],
     )
     if not samples:
-        if dataset_artifacts_exist(s3, prefix):
-            write_dataset_artifacts(s3, prefix, dataset_id, samples, masks)
+        deleted = delete_dataset_artifacts(s3, prefix)
+        if deleted:
+            log.info(
+                "Removed %s managed artifact(s) for dataset %s because no source images remain",
+                deleted,
+                dataset_id,
+            )
         return 0, len(masks)
     write_dataset_artifacts(s3, prefix, dataset_id, samples, masks)
     return len(samples), len(masks)
 
 
-def dataset_artifacts_exist(s3, prefix):
-    return any(
-        object_exists(s3, f"{prefix}/{suffix}")
-        for suffix in (
-            "manifest.yaml",
-            "indexes/content_hash_index.parquet",
-            "metadata/sample_manifests.parquet",
-            "metadata/samples.parquet",
+def delete_dataset_artifacts(s3, prefix):
+    keys = [
+        f"{prefix}/{suffix}"
+        for suffix in MANAGED_ARTIFACTS
+        if object_exists(s3, f"{prefix}/{suffix}")
+    ]
+    return delete_current_keys(s3, keys)
+
+
+def delete_current_keys(s3, keys):
+    deleted = 0
+    for i in range(0, len(keys), 1000):
+        chunk = keys[i:i + 1000]
+        if not chunk:
+            continue
+        response = s3.delete_objects(
+            Bucket=BUCKET,
+            Delete={"Objects": [{"Key": key} for key in chunk], "Quiet": True},
         )
-    )
+        deleted += len(chunk) - len(response.get("Errors", []))
+    return deleted
 
 
 def list_objects(s3, prefix):
@@ -253,97 +345,11 @@ def list_objects(s3, prefix):
 
 
 def scan_s3_images(s3, prefix, objects):
-    root = f"{prefix.rstrip('/')}/source/images/"
-    single_files = []
-    dicom_groups = {}
-
-    for obj in objects:
-        key = obj["key"]
-        if not key.startswith(root):
-            continue
-        rel = key[len(root):]
-        if not rel or rel.endswith("/"):
-            continue
-        filename = rel.rsplit("/", 1)[-1]
-        if not is_image_file(filename):
-            continue
-        if "/" in rel and filename.lower().endswith(".dcm"):
-            sample_id = rel.split("/", 1)[0]
-            dicom_groups.setdefault(sample_id, []).append((rel, obj))
-        else:
-            single_files.append((rel, obj))
-
-    samples = []
-    for rel, obj in sorted(single_files, key=lambda item: item[0]):
-        filename = rel.rsplit("/", 1)[-1]
-        samples.append({
-            "sample_id": sample_id_from_filename(filename),
-            "source_kind": "single_file",
-            "primary_filename": filename,
-            "uri_path": rel,
-            "files": [{"path": rel, "role": "primary"}],
-            "content_hash": sha256_s3_object(s3, obj["key"]),
-            "size": int(obj.get("size", 0)),
-            "last_modified": obj.get("last_modified"),
-            "etag": obj.get("etag"),
-        })
-
-    for sample_id in sorted(dicom_groups):
-        h = hashlib.sha256()
-        total_size = 0
-        files = []
-        last_modified = None
-        etags = []
-        for rel, obj in sorted(dicom_groups[sample_id], key=lambda item: item[0]):
-            content_hash = sha256_s3_object(s3, obj["key"])
-            h.update(content_hash.encode())
-            total_size += int(obj.get("size", 0))
-            last_modified = obj.get("last_modified") or last_modified
-            if obj.get("etag"):
-                etags.append(obj["etag"])
-            files.append({"path": rel, "role": "slice"})
-        samples.append({
-            "sample_id": sample_id,
-            "source_kind": "dicom_series",
-            "primary_filename": None,
-            "uri_path": f"{sample_id}/",
-            "files": files,
-            "content_hash": h.hexdigest(),
-            "size": total_size,
-            "last_modified": last_modified,
-            "etag": ",".join(etags) if etags else None,
-        })
-
-    return sorted(samples, key=lambda sample: sample["sample_id"])
+    return core_scan_s3_images(s3, BUCKET, prefix, objects)
 
 
 def scan_s3_masks(s3, prefix, objects, sample_ids=None):
-    root = f"{prefix.rstrip('/')}/source/masks/"
-    masks = []
-
-    for obj in objects:
-        key = obj["key"]
-        if not key.startswith(root):
-            continue
-        rel = key[len(root):]
-        if not rel or rel.endswith("/"):
-            continue
-        filename = rel.rsplit("/", 1)[-1]
-        if not is_image_file(filename):
-            continue
-        masks.append({
-            "sample_id": sample_id_from_mask_filename(filename, sample_ids),
-            "source_kind": "mask_file",
-            "primary_filename": filename,
-            "uri_path": rel,
-            "files": [{"path": rel, "role": "mask"}],
-            "content_hash": sha256_s3_object(s3, key),
-            "size": int(obj.get("size", 0)),
-            "last_modified": obj.get("last_modified"),
-            "etag": obj.get("etag"),
-        })
-
-    return sorted(masks, key=lambda sample: sample["sample_id"])
+    return core_scan_s3_masks(s3, BUCKET, prefix, objects, sample_ids=sample_ids)
 
 
 def write_dataset_artifacts(s3, prefix, dataset_id, samples, masks=None):
@@ -374,106 +380,26 @@ def write_dataset_artifacts(s3, prefix, dataset_id, samples, masks=None):
             )
         for rel_key, path in uploads:
             s3.upload_file(path, BUCKET, f"{prefix}/{rel_key}")
+        if not masks:
+            mask_index_key = f"{prefix}/indexes/masks_content_hash_index.parquet"
+            if object_exists(s3, mask_index_key):
+                delete_current_keys(s3, [mask_index_key])
 
 
 def build_hash_index(prefix, samples, source_path="images"):
-    now = utc_now()
-    if not samples:
-        return pa.table({
-            "sample_id": pa.array([], type=pa.string()),
-            "uri": pa.array([], type=pa.string()),
-            "content_hash": pa.array([], type=pa.string()),
-            "size": pa.array([], type=pa.int64()),
-            "last_modified": pa.array([], type=pa.string()),
-            "version_id": pa.array([], type=pa.string()),
-            "etag": pa.array([], type=pa.string()),
-            "source_kind": pa.array([], type=pa.string()),
-        })
-    return pa.table({
-        "sample_id": [s["sample_id"] for s in samples],
-        "uri": [f"s3://{BUCKET}/{prefix}/source/{source_path}/{s['uri_path']}" for s in samples],
-        "content_hash": [s["content_hash"] for s in samples],
-        "size": pa.array([s["size"] for s in samples], type=pa.int64()),
-        "last_modified": [s.get("last_modified") or now for s in samples],
-        "version_id": pa.array([None for _ in samples], type=pa.string()),
-        "etag": pa.array([s.get("etag") for s in samples], type=pa.string()),
-        "source_kind": [s["source_kind"] for s in samples],
-    })
+    return core_build_hash_index(samples, BUCKET, prefix, source_path=source_path)
 
 
 def build_sample_manifests(samples):
-    if not samples:
-        return pa.table({
-            "sample_id": pa.array([], type=pa.string()),
-            "source_kind": pa.array([], type=pa.string()),
-            "primary_uri": pa.array([], type=pa.string()),
-            "files_json": pa.array([], type=pa.string()),
-            "content_hash": pa.array([], type=pa.string()),
-            "n_files": pa.array([], type=pa.int32()),
-        })
-    return pa.table({
-        "sample_id": [s["sample_id"] for s in samples],
-        "source_kind": [s["source_kind"] for s in samples],
-        "primary_uri": pa.array([s["primary_filename"] for s in samples], type=pa.string()),
-        "files_json": [json.dumps(s["files"]) for s in samples],
-        "content_hash": [s["content_hash"] for s in samples],
-        "n_files": pa.array([len(s["files"]) for s in samples], type=pa.int32()),
-    })
+    return core_build_sample_manifests(samples)
 
 
 def build_samples_metadata(samples, extra_metadata=None):
-    if not samples:
-        base = pa.table({
-            "sample_id": pa.array([], type=pa.string()),
-            "source_kind": pa.array([], type=pa.string()),
-            "n_files": pa.array([], type=pa.int32()),
-        })
-    else:
-        base = pa.table({
-            "sample_id": [s["sample_id"] for s in samples],
-            "source_kind": [s["source_kind"] for s in samples],
-            "n_files": pa.array([len(s["files"]) for s in samples], type=pa.int32()),
-        })
-    if extra_metadata is None:
-        return base
-    return left_join_metadata(base, extra_metadata)
-
-
-def normalise_metadata_table(table):
-    if "sample_id" not in table.column_names:
-        return None
-    idx = table.column_names.index("sample_id")
-    return table.set_column(idx, "sample_id", table["sample_id"].cast(pa.string()))
-
-
-def left_join_metadata(base, extra_metadata):
-    extra_metadata = normalise_metadata_table(extra_metadata)
-    if extra_metadata is None:
-        return base
-
-    base_ids = base["sample_id"].to_pylist()
-    rows_by_id = {}
-    for row in extra_metadata.to_pylist():
-        sample_id = row.get("sample_id")
-        if sample_id in rows_by_id:
-            log.warning("Ignoring preserved metadata with duplicate sample_id: %s", sample_id)
-            return base
-        rows_by_id[sample_id] = row
-
-    extra_columns = [
-        name for name in extra_metadata.column_names
-        if name != "sample_id" and name not in base.column_names
-    ]
-    arrays = {name: base[name] for name in base.column_names}
-    schema = extra_metadata.schema
-    for name in extra_columns:
-        field = schema.field(name)
-        values = [
-            rows_by_id.get(sample_id, {}).get(name)
-            for sample_id in base_ids
-        ]
-        arrays[name] = pa.array(values, type=field.type)
-    return pa.table(arrays)
+    try:
+        return core_build_samples_metadata(samples, extra_metadata=extra_metadata)
+    except ValueError as e:
+        log.warning("Ignoring preserved metadata during reconcile: %s", e)
+        return core_build_samples_metadata(samples)
 
 
 def read_existing_samples_metadata(s3, prefix):
@@ -492,39 +418,9 @@ def read_existing_samples_metadata(s3, prefix):
 
 
 def generate_manifest(dataset_id, prefix, modality, has_masks=False):
-    manifest = {
-        "schema_version": 1,
-        "dataset_id": dataset_id,
-        "modality": modality,
-        "assets": {
-            "images": {
-                "uri": f"s3://{BUCKET}/{prefix}/source/images/",
-                "kind": "image_root",
-            },
-        },
-        "metadata": {
-            "uri": f"s3://{BUCKET}/{prefix}/metadata/samples.parquet",
-            "format": "parquet",
-        },
-        "content_hash_index": {
-            "uri": f"s3://{BUCKET}/{prefix}/indexes/content_hash_index.parquet",
-            "format": "parquet",
-        },
-        "sample_manifests": {
-            "uri": f"s3://{BUCKET}/{prefix}/metadata/sample_manifests.parquet",
-            "format": "parquet",
-        },
-    }
-    if has_masks:
-        manifest["assets"]["masks"] = {
-            "uri": f"s3://{BUCKET}/{prefix}/source/masks/",
-            "kind": "mask_root",
-            "content_hash_index": (
-                f"s3://{BUCKET}/{prefix}/indexes/"
-                "masks_content_hash_index.parquet"
-            ),
-        }
-    return manifest
+    return core_generate_manifest(
+        dataset_id, BUCKET, prefix, modality=modality, has_masks=has_masks
+    )
 
 
 def existing_modality(s3, prefix, fallback):
@@ -551,46 +447,6 @@ def write_yaml(tmpdir, filename, payload):
     with open(path, "w") as f:
         yaml.dump(payload, f, default_flow_style=False, sort_keys=False)
     return path
-
-
-def sha256_s3_object(s3, key):
-    h = hashlib.sha256()
-    response = s3.get_object(Bucket=BUCKET, Key=key)
-    body = response["Body"]
-    try:
-        for chunk in iter(lambda: body.read(65536), b""):
-            if chunk:
-                h.update(chunk)
-    finally:
-        body.close()
-    return h.hexdigest()
-
-
-def is_image_file(filename):
-    lower = filename.lower()
-    return any(lower.endswith(ext) for ext in IMAGE_EXTENSIONS)
-
-
-def sample_id_from_filename(filename):
-    lower = filename.lower()
-    for ext in sorted(IMAGE_EXTENSIONS, key=len, reverse=True):
-        if lower.endswith(ext):
-            return filename[:-len(ext)]
-    return os.path.splitext(filename)[0]
-
-
-def sample_id_from_mask_filename(filename, sample_ids=None):
-    stem = sample_id_from_filename(filename)
-    if sample_ids:
-        for sample_id in sorted(sample_ids, key=len, reverse=True):
-            if stem == sample_id or stem.startswith(f"{sample_id}_") or stem.startswith(f"{sample_id}-"):
-                return sample_id
-    suffix_pattern = (
-        r"(?i)(?:[_-](?:mask|seg|label|labels|roi|gtv[-_]?\d*|"
-        r"lesion[-_]?\d*|tumou?r[-_]?\d*))$"
-    )
-    stripped = re.sub(suffix_pattern, "", stem)
-    return stripped or stem
 
 
 def utc_now():
